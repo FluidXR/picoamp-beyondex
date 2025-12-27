@@ -38,6 +38,8 @@
 
 #include "pico/stdlib.h"
 #include "pico/bootrom.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
 #include "hardware/clocks.h"
 #include "hardware/dma.h"
 #include "hardware/uart.h"
@@ -48,6 +50,13 @@
 
 #include "i2s.h"
 #include "dsp/eq.h"
+
+// -------------------------------------------------------------------+
+// Live DSP tuning (WebUSB vendor control transfers)
+// -------------------------------------------------------------------+
+// These globals are referenced by dsp/vol.h and dsp/eq.h.
+int16_t g_volume_offset_steps = 2; // default headroom offset (1 dB steps)
+int16_t g_bass_eq_gain_db_x10 = 0; // 0.1 dB steps (e.g. +60 => +6.0 dB)
 
 //--------------------------------------------------------------------+
 // MACRO CONSTANT TYPEDEF PROTOTYPES
@@ -198,6 +207,16 @@ static void debug_uart_task(void) {
 // bmRequestType: 0xC0 (Device-to-host | Vendor | Device)
 #define BEYONDEX_USB_REQ_AUDIO_DIAG 0x43
 
+// Vendor control requests: live DSP tuning
+// bmRequestType:
+// - GET: 0xC0 (Device-to-host | Vendor | Device)
+// - SET/SAVE/LOAD/RESET: 0x40 (Host-to-device | Vendor | Device)
+#define BEYONDEX_USB_REQ_DSP_GET     0x50
+#define BEYONDEX_USB_REQ_DSP_SET_RAM 0x51
+#define BEYONDEX_USB_REQ_DSP_SAVE    0x52
+#define BEYONDEX_USB_REQ_DSP_LOAD    0x53
+#define BEYONDEX_USB_REQ_DSP_RESET   0x54
+
 typedef struct __attribute__((packed)) {
   uint32_t magic;     // 'BEXD' = 0x44584542
   uint32_t underrun;  // i2s_dbg_get_underrun_count()
@@ -205,6 +224,180 @@ typedef struct __attribute__((packed)) {
   int32_t  buf_len;   // i2s_get_buf_length()
   int32_t  buf_us;    // i2s_get_buf_us()
 } beyondex_audio_diag_t;
+
+// DSP params blob (binary protocol between firmware and WebUSB UI)
+typedef struct __attribute__((packed)) {
+  uint32_t magic;               // 'BDSP' = 0x50534442
+  uint16_t version;             // 3
+  uint16_t size;                // sizeof(beyondex_dsp_params_blob_t)
+  uint32_t flags;               // reserved for future use
+  int16_t  volume_offset_steps; // 1 dB steps, additional attenuation headroom (0..30 typical)
+  int16_t  bass_eq_gain_db_x10; // bass EQ gain in 0.1 dB steps (e.g. +60 => +6.0 dB)
+  uint32_t _reserved1[6];
+} beyondex_dsp_params_blob_t;
+
+#define BEYONDEX_DSP_BLOB_MAGIC   0x50534442u // 'BDSP'
+#define BEYONDEX_DSP_BLOB_VERSION 3u
+
+// Flash persistence (A/B slots with header + CRC32)
+typedef struct __attribute__((packed)) {
+  uint32_t magic;    // 'BDSF' = 0x46534442
+  uint16_t version;  // 1
+  uint16_t size;     // sizeof(beyondex_dsp_params_blob_t)
+  uint32_t seq;      // monotonically increasing
+  uint32_t crc32;    // CRC32 over the params blob bytes
+  uint32_t _rsvd;
+} beyondex_dsp_flash_header_t;
+
+#define BEYONDEX_DSP_FLASH_MAGIC 0x46534442u // 'BDSF'
+
+static beyondex_dsp_params_blob_t g_dsp_active = {
+  .magic = BEYONDEX_DSP_BLOB_MAGIC,
+  .version = BEYONDEX_DSP_BLOB_VERSION,
+  .size = (uint16_t)sizeof(beyondex_dsp_params_blob_t),
+  .flags = 0,
+  .volume_offset_steps = 2,
+  .bass_eq_gain_db_x10 = 0,
+};
+
+static beyondex_dsp_params_blob_t g_dsp_pending;
+static volatile bool g_dsp_pending_valid = false;
+
+static volatile bool g_dsp_req_save = false;
+static volatile bool g_dsp_req_load = false;
+static volatile bool g_dsp_req_reset_defaults = false;
+static volatile bool g_dsp_req_clear_saved = false;
+
+static uint32_t crc32_ieee(const uint8_t* data, size_t len) {
+  uint32_t crc = 0xFFFFFFFFu;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= (uint32_t)data[i];
+    for (int b = 0; b < 8; b++) {
+      uint32_t mask = (uint32_t)-(int32_t)(crc & 1u);
+      crc = (crc >> 1) ^ (0xEDB88320u & mask);
+    }
+  }
+  return ~crc;
+}
+
+static inline uint32_t dsp_flash_slot0_offset(void) {
+  // Reserve the last 2 flash sectors for settings (pico default flash is 2MB).
+  // NOTE: If firmware ever grows to fill flash, this needs a linker reservation.
+  return (uint32_t)(PICO_FLASH_SIZE_BYTES - 2u * FLASH_SECTOR_SIZE);
+}
+
+static inline uint32_t dsp_flash_slot1_offset(void) {
+  return dsp_flash_slot0_offset() + FLASH_SECTOR_SIZE;
+}
+
+static bool dsp_blob_validate(beyondex_dsp_params_blob_t const* b) {
+  if (!b) return false;
+  if (b->magic != BEYONDEX_DSP_BLOB_MAGIC) return false;
+  if (b->version != BEYONDEX_DSP_BLOB_VERSION) return false;
+  if (b->size != sizeof(beyondex_dsp_params_blob_t)) return false;
+  // Conservative ranges (can expand later)
+  if (b->volume_offset_steps < 0) return false;
+  if (b->volume_offset_steps > 30) return false;
+  if (b->bass_eq_gain_db_x10 < -120) return false;
+  if (b->bass_eq_gain_db_x10 >  120) return false;
+  return true;
+}
+
+static void dsp_apply_blob_now(beyondex_dsp_params_blob_t const* b) {
+  if (!b) return;
+  g_dsp_active = *b;
+  g_volume_offset_steps = g_dsp_active.volume_offset_steps;
+  user_bass_eq_set_gain_db_x10(g_dsp_active.bass_eq_gain_db_x10);
+}
+
+static void dsp_reset_to_defaults(bool clear_saved) {
+  beyondex_dsp_params_blob_t d = {
+    .magic = BEYONDEX_DSP_BLOB_MAGIC,
+    .version = BEYONDEX_DSP_BLOB_VERSION,
+    .size = (uint16_t)sizeof(beyondex_dsp_params_blob_t),
+    .flags = 0,
+    .volume_offset_steps = 2,
+    .bass_eq_gain_db_x10 = 0,
+  };
+  dsp_apply_blob_now(&d);
+  if (clear_saved) {
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase(dsp_flash_slot0_offset(), FLASH_SECTOR_SIZE * 2u);
+    restore_interrupts(ints);
+  }
+}
+
+static bool dsp_flash_read_slot(uint32_t slot_offset, beyondex_dsp_flash_header_t* hdr_out, beyondex_dsp_params_blob_t* blob_out) {
+  if (!hdr_out || !blob_out) return false;
+  const uint8_t* base = (const uint8_t*)(XIP_BASE + slot_offset);
+  memcpy(hdr_out, base, sizeof(*hdr_out));
+  if (hdr_out->magic != BEYONDEX_DSP_FLASH_MAGIC) return false;
+  if (hdr_out->version != BEYONDEX_DSP_BLOB_VERSION) return false;
+  if (hdr_out->size != sizeof(beyondex_dsp_params_blob_t)) return false;
+  memcpy(blob_out, base + sizeof(*hdr_out), sizeof(*blob_out));
+  if (!dsp_blob_validate(blob_out)) return false;
+  uint32_t crc = crc32_ieee((const uint8_t*)blob_out, sizeof(*blob_out));
+  if (crc != hdr_out->crc32) return false;
+  return true;
+}
+
+static bool dsp_flash_load_active(void) {
+  beyondex_dsp_flash_header_t h0, h1;
+  beyondex_dsp_params_blob_t b0, b1;
+  bool v0 = dsp_flash_read_slot(dsp_flash_slot0_offset(), &h0, &b0);
+  bool v1 = dsp_flash_read_slot(dsp_flash_slot1_offset(), &h1, &b1);
+  if (!v0 && !v1) return false;
+  if (v0 && (!v1 || h0.seq >= h1.seq)) {
+    dsp_apply_blob_now(&b0);
+    return true;
+  } else {
+    dsp_apply_blob_now(&b1);
+    return true;
+  }
+}
+
+static uint32_t dsp_flash_next_seq(void) {
+  beyondex_dsp_flash_header_t h0, h1;
+  beyondex_dsp_params_blob_t b0, b1;
+  bool v0 = dsp_flash_read_slot(dsp_flash_slot0_offset(), &h0, &b0);
+  bool v1 = dsp_flash_read_slot(dsp_flash_slot1_offset(), &h1, &b1);
+  uint32_t s0 = v0 ? h0.seq : 0;
+  uint32_t s1 = v1 ? h1.seq : 0;
+  uint32_t s = (s0 > s1) ? s0 : s1;
+  return s + 1u;
+}
+
+static void dsp_flash_save_active(void) {
+  uint8_t sector_buf[FLASH_SECTOR_SIZE];
+  memset(sector_buf, 0xFF, sizeof(sector_buf));
+
+  beyondex_dsp_flash_header_t hdr = {
+    .magic = BEYONDEX_DSP_FLASH_MAGIC,
+    .version = BEYONDEX_DSP_BLOB_VERSION,
+    .size = (uint16_t)sizeof(beyondex_dsp_params_blob_t),
+    .seq = dsp_flash_next_seq(),
+    .crc32 = crc32_ieee((const uint8_t*)&g_dsp_active, sizeof(g_dsp_active)),
+    ._rsvd = 0,
+  };
+
+  memcpy(sector_buf, &hdr, sizeof(hdr));
+  memcpy(sector_buf + sizeof(hdr), &g_dsp_active, sizeof(g_dsp_active));
+
+  beyondex_dsp_flash_header_t h0, h1;
+  beyondex_dsp_params_blob_t b0, b1;
+  bool v0 = dsp_flash_read_slot(dsp_flash_slot0_offset(), &h0, &b0);
+  bool v1 = dsp_flash_read_slot(dsp_flash_slot1_offset(), &h1, &b1);
+  uint32_t target = dsp_flash_slot0_offset();
+  if (v0 && (!v1 || h0.seq >= h1.seq)) target = dsp_flash_slot1_offset();
+  else if (v1 && (!v0 || h1.seq >= h0.seq)) target = dsp_flash_slot0_offset();
+
+  uint32_t ints = save_and_disable_interrupts();
+  flash_range_erase(target, FLASH_SECTOR_SIZE);
+  for (uint32_t off = 0; off < FLASH_SECTOR_SIZE; off += FLASH_PAGE_SIZE) {
+    flash_range_program(target + off, sector_buf + off, FLASH_PAGE_SIZE);
+  }
+  restore_interrupts(ints);
+}
 
 static volatile uint8_t g_bootsel_reboot_countdown = 0;
 
@@ -241,6 +434,9 @@ int main(void)
     audio_set_volume(volume[i], i);
   }
 
+  // Try to load saved DSP tuning params from flash (if present)
+  dsp_flash_load_active();
+
   while (1)
   {
     tud_task(); // TinyUSB device task
@@ -254,6 +450,28 @@ int main(void)
 #endif
     led_blinking_task();
     bootsel_task();
+
+    // Apply pending params at a safe boundary (outside of eq_process)
+    if (g_dsp_pending_valid) {
+      g_dsp_pending_valid = false;
+      dsp_apply_blob_now(&g_dsp_pending);
+    }
+
+    // Deferred tuning operations (flash ops can block, so don't do them inside EP0 callback)
+    if (g_dsp_req_reset_defaults) {
+      bool clear = g_dsp_req_clear_saved;
+      g_dsp_req_reset_defaults = false;
+      g_dsp_req_clear_saved = false;
+      dsp_reset_to_defaults(clear);
+    }
+    if (g_dsp_req_load) {
+      g_dsp_req_load = false;
+      dsp_flash_load_active();
+    }
+    if (g_dsp_req_save) {
+      g_dsp_req_save = false;
+      dsp_flash_save_active();
+    }
 #if BEYONDEX_DEBUG_UART
     debug_uart_task();
 #endif
@@ -641,39 +859,102 @@ void led_blinking_task(void)
 // for vendor-type requests not claimed by any class driver).
 bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *request)
 {
-  // Only need to act on SETUP stage
-  if (stage != CONTROL_STAGE_SETUP) return true;
-
-  // Handle a vendor request addressed to the device
-  if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_VENDOR &&
-      request->bmRequestType_bit.recipient == TUSB_REQ_RCPT_DEVICE &&
-      request->bRequest == BEYONDEX_USB_REQ_BOOTSEL &&
-      request->wValue == BEYONDEX_USB_BOOTSEL_MAGIC &&
-      request->wLength == 0)
-  {
-    // Acknowledge the request first, then reboot.
-    // (Reboot is queued via bootsel_task() to avoid disrupting the control transfer.)
-    g_bootsel_reboot_countdown = 2;
-
-    bool const ok = tud_control_status(rhport, request);
-    return ok;
+  // Only handle vendor requests addressed to the device
+  if (request->bmRequestType_bit.type != TUSB_REQ_TYPE_VENDOR ||
+      request->bmRequestType_bit.recipient != TUSB_REQ_RCPT_DEVICE) {
+    return false;
   }
 
-  // Read debug counters over USB control transfer (no UART/LED required)
-  if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_VENDOR &&
-      request->bmRequestType_bit.recipient == TUSB_REQ_RCPT_DEVICE &&
-      request->bmRequestType_bit.direction == TUSB_DIR_IN &&
-      request->bRequest == BEYONDEX_USB_REQ_AUDIO_DIAG &&
-      request->wLength == sizeof(beyondex_audio_diag_t))
-  {
-    static beyondex_audio_diag_t diag;
-    diag.magic = 0x44584542u; // 'BEXD'
-    diag.underrun = i2s_dbg_get_underrun_count();
-    diag.overflow = i2s_dbg_get_overflow_count();
-    diag.buf_len  = i2s_get_buf_length();
-    diag.buf_us   = i2s_get_buf_us();
+  // BOOTSEL request
+  if (request->bRequest == BEYONDEX_USB_REQ_BOOTSEL &&
+      request->wValue == BEYONDEX_USB_BOOTSEL_MAGIC &&
+      request->wLength == 0) {
+    if (stage == CONTROL_STAGE_SETUP) {
+      // Acknowledge the request first, then reboot.
+      // (Reboot is queued via bootsel_task() to avoid disrupting the control transfer.)
+      g_bootsel_reboot_countdown = 2;
+      return tud_control_status(rhport, request);
+    }
+    return true;
+  }
 
-    return tud_control_xfer(rhport, request, &diag, sizeof(diag));
+  // Audio diag
+  if (request->bmRequestType_bit.direction == TUSB_DIR_IN &&
+      request->bRequest == BEYONDEX_USB_REQ_AUDIO_DIAG &&
+      request->wLength == sizeof(beyondex_audio_diag_t)) {
+    if (stage == CONTROL_STAGE_SETUP) {
+      static beyondex_audio_diag_t diag;
+      diag.magic = 0x44584542u; // 'BEXD'
+      diag.underrun = i2s_dbg_get_underrun_count();
+      diag.overflow = i2s_dbg_get_overflow_count();
+      diag.buf_len  = i2s_get_buf_length();
+      diag.buf_us   = i2s_get_buf_us();
+      return tud_control_xfer(rhport, request, &diag, sizeof(diag));
+    }
+    return true;
+  }
+
+  // DSP tuning: GET (active params blob)
+  if (request->bmRequestType_bit.direction == TUSB_DIR_IN &&
+      request->bRequest == BEYONDEX_USB_REQ_DSP_GET &&
+      request->wLength == sizeof(beyondex_dsp_params_blob_t)) {
+    if (stage == CONTROL_STAGE_SETUP) {
+      // Keep active blob consistent with current runtime knobs
+      g_dsp_active.volume_offset_steps = g_volume_offset_steps;
+      g_dsp_active.bass_eq_gain_db_x10 = g_bass_eq_gain_db_x10;
+      return tud_control_xfer(rhport, request, &g_dsp_active, sizeof(g_dsp_active));
+    }
+    return true;
+  }
+
+  // DSP tuning: SET (RAM) - multi-stage OUT: buffer in SETUP, apply in ACK
+  if (request->bmRequestType_bit.direction == TUSB_DIR_OUT &&
+      request->bRequest == BEYONDEX_USB_REQ_DSP_SET_RAM &&
+      request->wLength == sizeof(beyondex_dsp_params_blob_t)) {
+    static beyondex_dsp_params_blob_t rx_blob;
+    if (stage == CONTROL_STAGE_SETUP) {
+      return tud_control_xfer(rhport, request, &rx_blob, sizeof(rx_blob));
+    } else if (stage == CONTROL_STAGE_ACK) {
+      if (!dsp_blob_validate(&rx_blob)) return false; // stall invalid blobs
+      g_dsp_pending = rx_blob;
+      g_dsp_pending_valid = true;
+      return true;
+    }
+    return true;
+  }
+
+  // DSP tuning: SAVE (flash) - deferred
+  if (request->bmRequestType_bit.direction == TUSB_DIR_OUT &&
+      request->bRequest == BEYONDEX_USB_REQ_DSP_SAVE &&
+      request->wLength == 0) {
+    if (stage == CONTROL_STAGE_SETUP) {
+      g_dsp_req_save = true;
+      return tud_control_status(rhport, request);
+    }
+    return true;
+  }
+
+  // DSP tuning: LOAD (flash) - deferred
+  if (request->bmRequestType_bit.direction == TUSB_DIR_OUT &&
+      request->bRequest == BEYONDEX_USB_REQ_DSP_LOAD &&
+      request->wLength == 0) {
+    if (stage == CONTROL_STAGE_SETUP) {
+      g_dsp_req_load = true;
+      return tud_control_status(rhport, request);
+    }
+    return true;
+  }
+
+  // DSP tuning: RESET defaults (wValue!=0 => clear saved)
+  if (request->bmRequestType_bit.direction == TUSB_DIR_OUT &&
+      request->bRequest == BEYONDEX_USB_REQ_DSP_RESET &&
+      request->wLength == 0) {
+    if (stage == CONTROL_STAGE_SETUP) {
+      g_dsp_req_reset_defaults = true;
+      g_dsp_req_clear_saved = (request->wValue != 0);
+      return tud_control_status(rhport, request);
+    }
+    return true;
   }
 
   // Stall unsupported vendor requests

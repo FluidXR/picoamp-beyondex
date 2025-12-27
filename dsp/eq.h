@@ -2,12 +2,89 @@
 #define PICO_AMP_EQ_H
 
 #include <stdio.h>
+#include <math.h>
 
 #include "pico/stdlib.h"
 
 #include "dsp.h"
 #include "vol.h"
 #include "i2s.h"
+
+// Runtime tuning knob: bass EQ gain (true EQ adjustment), in 0.1 dB steps.
+// Example: +60 => +6.0 dB.
+extern int16_t g_bass_eq_gain_db_x10;
+
+// Coefficients for a user-controlled low-shelf filter, stored in Q3.28 and used
+// as (a0,a1,a2,b1,b2) in process_biquad().
+static int32_t g_user_bass_a0 = 0;
+static int32_t g_user_bass_a1 = 0;
+static int32_t g_user_bass_a2 = 0;
+static int32_t g_user_bass_b1 = 0;
+static int32_t g_user_bass_b2 = 0;
+
+static inline float clamp_f(float v, float lo, float hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+// RBJ Audio EQ Cookbook low-shelf. We compute coefficients in float and convert
+// to Q3.28 once per parameter update (NOT per sample).
+static inline void user_bass_eq_set_gain_db_x10(int16_t gain_db_x10) {
+  // Clamp to a sane range. Users can still clip if they boost too much; the UI
+  // should encourage adding headroom via volume offset.
+  if (gain_db_x10 < -120) gain_db_x10 = -120;
+  if (gain_db_x10 >  120) gain_db_x10 =  120;
+  g_bass_eq_gain_db_x10 = gain_db_x10;
+
+  // If gain is ~0, make it identity
+  if (gain_db_x10 == 0) {
+    g_user_bass_a0 = (int32_t)floatfx3(1.0f);
+    g_user_bass_a1 = 0;
+    g_user_bass_a2 = 0;
+    g_user_bass_b1 = 0;
+    g_user_bass_b2 = 0;
+    return;
+  }
+
+  const float fs = 48000.0f;       // only supported rate in this firmware
+  const float f0 = 95.0f;          // low-shelf corner frequency (Hz)
+  const float S  = 1.0f;           // shelf slope
+  const float gain_db = (float)gain_db_x10 / 10.0f;
+
+  const float A = powf(10.0f, gain_db / 40.0f);
+  const float PI = 3.14159265358979323846f;
+  const float w0 = 2.0f * PI * (f0 / fs);
+  const float cw0 = cosf(w0);
+  const float sw0 = sinf(w0);
+  const float alpha = (sw0 / 2.0f) * sqrtf((A + 1.0f / A) * (1.0f / S - 1.0f) + 2.0f);
+  const float two_sqrtA_alpha = 2.0f * sqrtf(A) * alpha;
+
+  float b0 =    A * ((A + 1.0f) - (A - 1.0f) * cw0 + two_sqrtA_alpha);
+  float b1 =  2*A * ((A - 1.0f) - (A + 1.0f) * cw0);
+  float b2 =    A * ((A + 1.0f) - (A - 1.0f) * cw0 - two_sqrtA_alpha);
+  float a0 =        (A + 1.0f) + (A - 1.0f) * cw0 + two_sqrtA_alpha;
+  float a1 =   -2.0f * ((A - 1.0f) + (A + 1.0f) * cw0);
+  float a2 =        (A + 1.0f) + (A - 1.0f) * cw0 - two_sqrtA_alpha;
+
+  // Normalize
+  b0 /= a0; b1 /= a0; b2 /= a0;
+  a1 /= a0; a2 /= a0;
+
+  // Basic safety clamp before quantization (these ranges are conservative)
+  b0 = clamp_f(b0, -4.0f, 4.0f);
+  b1 = clamp_f(b1, -4.0f, 4.0f);
+  b2 = clamp_f(b2, -4.0f, 4.0f);
+  a1 = clamp_f(a1, -4.0f, 4.0f);
+  a2 = clamp_f(a2, -4.0f, 4.0f);
+
+  // Convert to Q3.28 (stored in int32)
+  g_user_bass_a0 = (int32_t)floatfx3(b0);
+  g_user_bass_a1 = (int32_t)floatfx3(b1);
+  g_user_bass_a2 = (int32_t)floatfx3(b2);
+  g_user_bass_b1 = (int32_t)floatfx3(a1);
+  g_user_bass_b2 = (int32_t)floatfx3(a2);
+}
 
 // dsp audio buffers
 dspfx buf0[192];
@@ -18,6 +95,7 @@ dspfx out_buf[192];
 // equalizer filters
 biquad(eq_bq_0)
 biquad(eq_bq_00) // TODO:
+biquad(eq_bq_user_bass)
 biquad(eq_bq_1)
 biquad(eq_bq_2)
 biquad(eq_bq_3)
@@ -196,6 +274,16 @@ static void __not_in_flash_func(eq_process)(uint8_t* buffer, int sample, uint8_t
 #endif
 #endif
 
+    // Select the EQ output buffer (compile-time macro decides which buffer holds the last stage)
+    dspfx* eq_src = (dspfx*)LAST_EQ_BUF;
+
+    // User bass EQ (true low-shelf) on the final EQ output.
+    // This is a real EQ adjustment (not the bass enhancer/mixer below).
+    if (g_bass_eq_gain_db_x10 != 0) {
+        process_biquad(&eq_bq_user_bass, g_user_bass_a0, g_user_bass_a1, g_user_bass_a2, g_user_bass_b1, g_user_bass_b2, count, eq_src, buf2);
+        eq_src = buf2;
+    }
+
     // volume
     dspfx volume_mul[96] = {0};
     for (int i = 0; i < count; i++) {
@@ -212,8 +300,8 @@ static void __not_in_flash_func(eq_process)(uint8_t* buffer, int sample, uint8_t
         else
             current_vol_r = (mute_r ? 0 : vol_mul_r);
         volume_mul[i] = current_vol_l > current_vol_r ? current_vol_l : current_vol_r;
-        buf0[i*2] = mulfx2(LAST_EQ_BUF[i*2], current_vol_l);
-        buf0[i*2+1] = mulfx2(LAST_EQ_BUF[i*2+1], current_vol_r);
+        buf0[i*2] = mulfx2(eq_src[i*2], current_vol_l);
+        buf0[i*2+1] = mulfx2(eq_src[i*2+1], current_vol_r);
     }
 
     // amp

@@ -26,6 +26,7 @@ endif()
 set(PICO_BOARD pico CACHE STRING "Board type")
 
 # Pull in Raspberry Pi Pico SDK (must be before project)
+set(PICO_SDK_FETCH_FROM_GIT ON)
 include(pico_sdk_import.cmake)
 
 project(beyondex_usb_speaker C CXX ASM)

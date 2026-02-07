@@ -94,6 +94,27 @@ enum
 
 static uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
 
+//--------------------------------------------------------------------+
+// ADAPTIVE CLOCK TRIM
+// Auto-detect when USB feedback is not working (e.g. Windows) and
+// enable device-side clock trimming only when needed.
+//--------------------------------------------------------------------+
+#if I2S_ENABLE_CLOCK_TRIM
+static bool adaptive_trim_enabled = false;
+static uint32_t adaptive_trim_startup_ms = 0;
+static int32_t adaptive_trim_baseline_us = 0;
+static uint32_t adaptive_trim_last_check_ms = 0;
+
+// Detection thresholds:
+// If buffer loses > DRAIN_THRESHOLD_US over DETECT_WINDOW_MS, enable trim
+// If buffer is stable for STABLE_WINDOW_MS, disable trim
+#define ADAPTIVE_STARTUP_DELAY_MS    5000   // Wait 5s after audio starts
+#define ADAPTIVE_DETECT_WINDOW_MS    15000  // Check for drain over 15s
+#define ADAPTIVE_STABLE_WINDOW_MS    30000  // Require 30s stability to disable
+#define ADAPTIVE_DRAIN_THRESHOLD_US  1500   // > 1.5ms loss over 15s = feedback broken
+#define ADAPTIVE_STABLE_THRESHOLD_US 1000   // < 1ms drift = feedback working
+#endif
+
 // Audio controls
 // Current states
 int8_t mute[CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1];       // +1 for master channel 0
@@ -255,12 +276,61 @@ int main(void)
   {
     tud_task(); // TinyUSB device task
     audio_task();
-    // USB Audio feedback already regulates the host send rate. Running an
-    // additional device-side clock trim loop can create slow oscillations
-    // (periodic pops/fuzz). Keep disabled by default.
+
 #if I2S_ENABLE_CLOCK_TRIM
-    // Compute-only clock trim (divider is applied safely in the DMA IRQ handler)
-    i2s_clock_trim();
+    // Adaptive clock trim: Auto-detect when USB feedback isn't working
+    // (e.g. Windows) and enable device-side clock trim only when needed.
+    // This prevents competing control loops on hosts where feedback works (macOS).
+
+    uint32_t curr_ms = board_millis();
+    int32_t curr_buf_us = i2s_get_buf_us();
+
+    // Wait for startup stabilization
+    if (adaptive_trim_startup_ms == 0 && curr_buf_us > 0) {
+      adaptive_trim_startup_ms = curr_ms;
+      adaptive_trim_baseline_us = curr_buf_us;
+      adaptive_trim_last_check_ms = curr_ms;
+    }
+
+    if (adaptive_trim_startup_ms > 0 &&
+        (curr_ms - adaptive_trim_startup_ms) > ADAPTIVE_STARTUP_DELAY_MS) {
+
+      uint32_t elapsed_ms = curr_ms - adaptive_trim_last_check_ms;
+
+      if (!adaptive_trim_enabled && elapsed_ms >= ADAPTIVE_DETECT_WINDOW_MS) {
+        // Check if buffer is draining (feedback not working)
+        int32_t buffer_change = curr_buf_us - adaptive_trim_baseline_us;
+        if (buffer_change < -ADAPTIVE_DRAIN_THRESHOLD_US) {
+          // Buffer is draining! Enable clock trim
+          adaptive_trim_enabled = true;
+          adaptive_trim_baseline_us = curr_buf_us;
+          adaptive_trim_last_check_ms = curr_ms;
+        } else {
+          // Reset baseline for next check
+          adaptive_trim_baseline_us = curr_buf_us;
+          adaptive_trim_last_check_ms = curr_ms;
+        }
+      } else if (adaptive_trim_enabled && elapsed_ms >= ADAPTIVE_STABLE_WINDOW_MS) {
+        // Check if buffer is stable (feedback working again?)
+        int32_t buffer_change = curr_buf_us - adaptive_trim_baseline_us;
+        if (buffer_change > -ADAPTIVE_STABLE_THRESHOLD_US &&
+            buffer_change < ADAPTIVE_STABLE_THRESHOLD_US) {
+          // Buffer is stable! Disable clock trim
+          adaptive_trim_enabled = false;
+          adaptive_trim_baseline_us = curr_buf_us;
+          adaptive_trim_last_check_ms = curr_ms;
+        } else {
+          // Reset baseline for next check
+          adaptive_trim_baseline_us = curr_buf_us;
+          adaptive_trim_last_check_ms = curr_ms;
+        }
+      }
+    }
+
+    // Only call clock trim if adaptively enabled
+    if (adaptive_trim_enabled) {
+      i2s_clock_trim();
+    }
 #endif
     led_blinking_task();
     bootsel_task();

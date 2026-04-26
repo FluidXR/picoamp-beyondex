@@ -38,7 +38,15 @@
 
 #include <stdint.h>
 
+// Enables an extra HID interface that streams audio diagnostics for the
+// `tools/audio_diag_plot.py` plotter. Disabled by default because the extra
+// interface confuses Windows' MS OS 2.0 / WinUSB binding for the vendor
+// interface, which breaks the WebUSB updater's "enter BOOTSEL" trigger on
+// Windows. Override at build time with `-DBEYONDEX_HID_DEBUG=1` only when
+// actively running the diagnostics tool.
+#ifndef BEYONDEX_HID_DEBUG
 #define BEYONDEX_HID_DEBUG 0
+#endif
 
 // Unit numbers are arbitrary selected
 #define UAC2_ENTITY_CLOCK               0x04

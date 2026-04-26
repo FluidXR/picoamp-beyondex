@@ -110,6 +110,38 @@ The easiest "no-button" flow is to use the [Beyondex Firmware Update Tool](https
 
 
 
+### Diagnostics build (developer only)
+
+When tracking down audio issues, the firmware can expose an extra HID
+interface that streams `beyondex_audio_diag_t` reports — buffer fill, USB
+SOF counters, current feedback value, etc. The `tools/audio_diag_plot.py`
+script reads these reports cross-platform and plots them live.
+
+This is **off by default** because the extra HID interface confuses
+Windows' MS OS 2.0 / WinUSB binding for the vendor interface, which
+breaks the WebUSB updater's "enter BOOTSEL" trigger on Windows. Only
+enable it on a developer unit, and revert before shipping.
+
+To produce a diagnostics build:
+
+```bash
+cmake -S . -B build-diag -G Ninja \
+      -DCMAKE_C_FLAGS="-DBEYONDEX_HID_DEBUG=1" \
+      -DCMAKE_CXX_FLAGS="-DBEYONDEX_HID_DEBUG=1"
+cmake --build build-diag -j
+```
+
+Flash `build-diag/beyondex_usb_speaker.uf2` to the device, then on the
+host:
+
+```bash
+pip install hidapi matplotlib
+python3 tools/audio_diag_plot.py
+```
+
+To go back to the normal firmware (and restore Windows BOOTSEL via the
+WebUSB updater), rebuild without the flag and re-flash.
+
 ### Tuning / DSP
 
 Filter configuration lives in `dsp/` and can be generated with tools like Room EQ Wizard (REW). Start by looking at the EQ headers in `dsp/`.

@@ -115,9 +115,15 @@ uint8_t current_resolution;
 
 static volatile bool spk_streaming_active;
 
-uint32_t feedback;
-uint32_t sof_calls;
-uint32_t sof_updates;
+// Set when the host requests the MS OS 2.0 descriptor set, which only Windows
+// does. Used to pick the USB Audio feedback format: Windows' UAC2 driver has a
+// known bug requiring 16.16 on full-speed (vs the spec'd 10.14), while macOS
+// and Linux follow the spec.
+static volatile bool host_is_windows;
+
+static volatile uint32_t feedback;
+static volatile uint32_t sof_calls;
+static volatile uint32_t sof_updates;
 
 void led_blinking_task(void);
 void audio_task(void);
@@ -242,6 +248,9 @@ int main(void)
 void tud_mount_cb(void)
 {
   blink_interval_ms = BLINK_MOUNTED;
+  // Re-arm the SOF callback on every mount: TinyUSB clears its enable state on
+  // bus reset, so toggling off→on guarantees the feedback loop runs after a
+  // host-side disconnect/reconnect even though tud_init() already enabled it.
   tud_sof_cb_enable(false);
   tud_sof_cb_enable(true);
 }
@@ -250,6 +259,7 @@ void tud_mount_cb(void)
 void tud_umount_cb(void)
 {
   blink_interval_ms = BLINK_NOT_MOUNTED;
+  host_is_windows = false;
 }
 
 // Invoked when usb bus is suspended
@@ -497,7 +507,7 @@ bool tud_audio_set_itf_close_EP_cb(uint8_t rhport, tusb_control_request_t const 
 
 static int32_t fb_avg_us = 0;
 static int32_t fb_i_us = 0;
-static int32_t fb_last_q16 = 0;
+static bool fb_avg_primed = false;
 
 static inline int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi)
 {
@@ -516,7 +526,7 @@ void tud_sof_cb(uint32_t frame_count)
   {
     fb_avg_us = 0;
     fb_i_us = 0;
-    fb_last_q16 = 0;
+    fb_avg_primed = false;
     return;
   }
 
@@ -528,8 +538,10 @@ void tud_sof_cb(uint32_t frame_count)
   int32_t us = i2s_get_buf_us();
 
   // 1st-order IIR LPF to suppress packet jitter
-  if (fb_avg_us == 0)
+  if (!fb_avg_primed) {
     fb_avg_us = us;
+    fb_avg_primed = true;
+  }
   fb_avg_us = (fb_avg_us * 63 + us) >> 6;
 
   // Positive == buffer below target == host must speed up (increase feedback)
@@ -548,7 +560,9 @@ void tud_sof_cb(uint32_t frame_count)
   // Convert integrated error to 16.16 delta with a small gain.
   // SHIFT controls integral gain: smaller == stronger.
   const int I_SHIFT = 18;
-  int32_t i_q16 = (fb_i_us << 16) >> I_SHIFT; // (us * 2^16) / 2^I_SHIFT
+  // 64-bit intermediate: fb_i_us is clamped to ±50000 and `<< 16` would
+  // overflow int32 above ±32767, sign-flipping the integral term.
+  int32_t i_q16 = (int32_t)(((int64_t)fb_i_us << 16) >> I_SHIFT);
   // Clamp integral contribution tighter than full-scale to prevent hunting
   const int32_t I_MAX_DELTA_Q16 = (1 << 15); // 0.5 sample/ms
   i_q16 = clamp_i32(i_q16, -I_MAX_DELTA_Q16, I_MAX_DELTA_Q16);
@@ -565,7 +579,6 @@ void tud_sof_cb(uint32_t frame_count)
   int32_t max_fb_q16 = nominal_q16 + (1 << 16);
   fb_q16 = clamp_i32(fb_q16, min_fb_q16, max_fb_q16);
 
-  fb_last_q16 = fb_q16;
   tud_audio_fb_set((uint32_t)fb_q16);
   sof_updates++;
 
@@ -575,7 +588,10 @@ void tud_sof_cb(uint32_t frame_count)
 bool tud_audio_feedback_format_correction_cb(uint8_t func_id)
 {
   (void)func_id;
-  return false;
+  // On full-speed, USB 2.0 spec says feedback is 10.14. Windows' UAC2 driver
+  // ignores that and wants 16.16 — so for Windows we send raw 16.16. Every
+  // other host gets TinyUSB's automatic 16.16→10.14 conversion.
+  return !host_is_windows;
 }
 
 bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const * p_request)
@@ -677,6 +693,7 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
     case VENDOR_REQUEST_MICROSOFT:
       if (request->wIndex == 7)
       {
+        host_is_windows = true;
         uint16_t total_len;
         memcpy(&total_len, desc_ms_os_20 + 8, 2);
         return tud_control_xfer(rhport, request, (void *)(uintptr_t)desc_ms_os_20, total_len);

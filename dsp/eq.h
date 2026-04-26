@@ -156,10 +156,13 @@ static void __not_in_flash_func(eq_process)(uint8_t* buffer, int sample, uint8_t
             return;
         }
 
-    // Channel swap (L <-> R) when enabled via WebUSB settings
+    // Hardware routing on this board has L/R reversed at the I2S output, so the
+    // default firmware behavior is to swap the channels. The "channel swap"
+    // setting (g_channel_swap=1) disables the compensation, exposing the raw
+    // hardware ordering.
     {
         extern volatile uint8_t g_channel_swap;
-        if (g_channel_swap) {
+        if (!g_channel_swap) {
             for (int i = 0; i < count * 2; i += 2) {
                 dspfx tmp = buf0[i];
                 buf0[i] = buf0[i+1];

@@ -67,7 +67,12 @@ tusb_desc_device_t const desc_device =
 
     .idVendor           = 0xCafe,
     .idProduct          = USB_PID,
-    .bcdDevice          = 0x0100,
+    // Bump on every release so Windows re-evaluates cached driver state for
+    // this VID/PID. Without this, a single poisoned enumeration (e.g. Code 10
+    // from a transient timeout) sticks across firmware updates because Windows
+    // keys its driver cache on (VID, PID, bcdDevice, Serial) and rollbacks
+    // alone don't change any of those.
+    .bcdDevice          = 0x0141,
 
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,

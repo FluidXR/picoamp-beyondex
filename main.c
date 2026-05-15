@@ -259,7 +259,14 @@ void tud_mount_cb(void)
 void tud_umount_cb(void)
 {
   blink_interval_ms = BLINK_NOT_MOUNTED;
-  host_is_windows = false;
+  // Intentionally do NOT clear host_is_windows here. Windows only issues the
+  // MS OS 2.0 vendor request the first time it installs the device; on every
+  // subsequent enumeration (USB selective suspend, sleep/resume, hub reset)
+  // it uses cached driver state and skips that request. If we cleared the
+  // flag on umount, tud_audio_feedback_format_correction_cb would then send
+  // 10.14 feedback to a Windows host that expects raw 16.16, the host's
+  // clock estimate would drift, and audio would silently fall over until the
+  // user replugs.
 }
 
 // Invoked when usb bus is suspended

@@ -28,32 +28,54 @@ set(PICO_BOARD pico CACHE STRING "Board type")
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
 
-# TinyUSB 0.18.0 (bundled with SDK 2.1.1) breaks USB Audio on Windows.
-# Pin to 0.17.0 until a fixed version is available.
+# Use our vendored, patched TinyUSB instead of the SDK's bundled copy.
+#
+# Background: SDK 2.1.1 ships TinyUSB 0.18.0, which breaks USB Audio on Windows
+# (see commit 4b6f971). We pinned to 0.17.0. But 0.17.0 has a separate RP2040
+# DCD bug — _hw_endpoint_alloc is a bump allocator that doesn't reclaim DPRAM
+# per-EP, only when ALL non-control EPs are closed. With our always-open WinUSB
+# vendor interface plus iso audio EPs that cycle on every audio session start/stop,
+# DPRAM exhausts after a few cycles and hard_assert panics the firmware. Upstream
+# fix is hathach/tinyusb PR #1802; we backport it into our vendored 0.17.0 here.
+#
+# PICO_TINYUSB_PATH is the documented override point in pico-sdk's
+# src/rp2_common/tinyusb/CMakeLists.txt — set before pico_sdk_init() so the SDK
+# uses our tree, not its own.
+set(PICO_TINYUSB_PATH "${CMAKE_CURRENT_LIST_DIR}/lib/tinyusb" CACHE PATH "TinyUSB source tree")
+
 set(BEYONDEX_REQUIRED_TUSB_VERSION "0.17.0")
-if(EXISTS "${PICO_SDK_PATH}/lib/tinyusb/src/tusb_option.h")
-    file(STRINGS "${PICO_SDK_PATH}/lib/tinyusb/src/tusb_option.h" _tusb_ver_lines
-         REGEX "^#define TUSB_VERSION_(MAJOR|MINOR|REVISION)")
-    foreach(_line ${_tusb_ver_lines})
-        if(_line MATCHES "TUSB_VERSION_MAJOR[ \t]+([0-9]+)")
-            set(_tusb_major ${CMAKE_MATCH_1})
-        elseif(_line MATCHES "TUSB_VERSION_MINOR[ \t]+([0-9]+)")
-            set(_tusb_minor ${CMAKE_MATCH_1})
-        elseif(_line MATCHES "TUSB_VERSION_REVISION[ \t]+([0-9]+)")
-            set(_tusb_rev ${CMAKE_MATCH_1})
-        endif()
-    endforeach()
-    if(DEFINED _tusb_major)
-        set(_tusb_ver "${_tusb_major}.${_tusb_minor}.${_tusb_rev}")
-        if(NOT _tusb_ver VERSION_EQUAL ${BEYONDEX_REQUIRED_TUSB_VERSION})
-            message(FATAL_ERROR
-                "TinyUSB ${_tusb_ver} detected but ${BEYONDEX_REQUIRED_TUSB_VERSION} is required.\n"
-                "Run: git -C \"${PICO_SDK_PATH}/lib/tinyusb\" fetch --tags origin && "
-                "git -C \"${PICO_SDK_PATH}/lib/tinyusb\" checkout ${BEYONDEX_REQUIRED_TUSB_VERSION}")
-        endif()
-        message(STATUS "TinyUSB version: ${_tusb_ver} (OK)")
-    endif()
+if(NOT EXISTS "${PICO_TINYUSB_PATH}/src/tusb_option.h")
+    message(FATAL_ERROR "Vendored TinyUSB missing at ${PICO_TINYUSB_PATH}")
 endif()
+file(STRINGS "${PICO_TINYUSB_PATH}/src/tusb_option.h" _tusb_ver_lines
+     REGEX "^#define TUSB_VERSION_(MAJOR|MINOR|REVISION)")
+foreach(_line ${_tusb_ver_lines})
+    if(_line MATCHES "TUSB_VERSION_MAJOR[ \t]+([0-9]+)")
+        set(_tusb_major ${CMAKE_MATCH_1})
+    elseif(_line MATCHES "TUSB_VERSION_MINOR[ \t]+([0-9]+)")
+        set(_tusb_minor ${CMAKE_MATCH_1})
+    elseif(_line MATCHES "TUSB_VERSION_REVISION[ \t]+([0-9]+)")
+        set(_tusb_rev ${CMAKE_MATCH_1})
+    endif()
+endforeach()
+set(_tusb_ver "${_tusb_major}.${_tusb_minor}.${_tusb_rev}")
+if(NOT _tusb_ver VERSION_EQUAL ${BEYONDEX_REQUIRED_TUSB_VERSION})
+    message(FATAL_ERROR
+        "Vendored TinyUSB at ${PICO_TINYUSB_PATH} is ${_tusb_ver}, "
+        "expected ${BEYONDEX_REQUIRED_TUSB_VERSION}.")
+endif()
+
+# Also verify the PR #1802 patch is present in the vendored copy — without it
+# audio start/stop cycling will wedge the firmware after a few cycles.
+file(STRINGS "${PICO_TINYUSB_PATH}/src/portable/raspberrypi/rp2040/dcd_rp2040.c"
+     _patch_marker REGEX "PR #1802 backport" LIMIT_COUNT 1)
+if(NOT _patch_marker)
+    message(FATAL_ERROR
+        "Vendored TinyUSB is missing the PR #1802 backport "
+        "(dcd_rp2040.c marker not found). The build would compile but produce "
+        "firmware that wedges on Windows audio session churn.")
+endif()
+message(STATUS "TinyUSB version: ${_tusb_ver} (vendored, PR #1802 patched)")
 
 project(beyondex_usb_speaker C CXX ASM)
 

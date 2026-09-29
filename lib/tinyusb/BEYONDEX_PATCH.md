@@ -60,3 +60,31 @@ that script.
 When upstream TinyUSB ships a tagged release that contains both PR #1802 and a
 fix for the Windows USB Audio regression that drove us to pin 0.17.0, this
 vendored copy can be removed and the SDK's bundled TinyUSB used directly.
+
+## Patch 2: vendor class reset (re-enumeration without power cycle)
+
+`src/class/vendor/vendor_device.c` — `vendord_reset()` now also calls
+`tu_edpt_stream_close()` on the rx and tx streams (search for
+`Beyondex vendor reset patch`).
+
+**Bug:** `tud_vendor_n_mounted()` decides whether a vendor slot is in use by
+looking at `rx.stream.ep_addr` / `tx.stream.ep_addr`. Those fields sit after
+`ITF_MEM_RESET_SIZE`, and 0.17.0's `vendord_reset()` only cleared the stream
+FIFOs, never `ep_addr`. After the first `SET_CONFIGURATION` the slot therefore
+looked permanently in use. On any later configuration (host reboot while the
+device stays powered, Device Manager disable/enable, hub reset) `vendord_open()`
+found no free slot, returned 0, `process_set_config()` found no driver for the
+WinUSB interface, and TinyUSB STALLed `SET_CONFIGURATION`. Windows reports this
+as Code 10 on the USB Composite Device; only a replug (RAM cleared) recovers.
+
+**Evidence:** a USBHUB3/UCX ETW trace of a Device Manager disable/enable showed
+`URB_FUNCTION_SELECT_CONFIGURATION` completing with `USBD_STATUS_STALL_PID`
+(0xC0000004) on four consecutive enumeration attempts, after all descriptor
+reads succeeded.
+
+**Upstream:** hathach/tinyusb master's `vendord_reset()` clears and closes both
+streams, so this patch can be dropped along with the rest of the vendored copy.
+
+**Regression test:** `tools/test_reenumeration.ps1` (elevated) disables and
+re-enables the composite device repeatedly and checks it comes back each time.
+Pre-patch firmware fails on the first cycle.

@@ -75,7 +75,17 @@ if(NOT _patch_marker)
         "(dcd_rp2040.c marker not found). The build would compile but produce "
         "firmware that wedges on Windows audio session churn.")
 endif()
-message(STATUS "TinyUSB version: ${_tusb_ver} (vendored, PR #1802 patched)")
+# And the vendor-class reset patch: without it the device only configures once
+# per power cycle, so a host reboot or driver restart leaves it stuck at Code 10.
+file(STRINGS "${PICO_TINYUSB_PATH}/src/class/vendor/vendor_device.c"
+     _vendor_patch_marker REGEX "Beyondex vendor reset patch" LIMIT_COUNT 1)
+if(NOT _vendor_patch_marker)
+    message(FATAL_ERROR
+        "Vendored TinyUSB is missing the vendor reset patch "
+        "(vendor_device.c marker not found). The firmware would fail to "
+        "re-enumerate after a host reboot without a power cycle.")
+endif()
+message(STATUS "TinyUSB version: ${_tusb_ver} (vendored, PR #1802 + vendor reset patched)")
 
 project(beyondex_usb_speaker C CXX ASM)
 

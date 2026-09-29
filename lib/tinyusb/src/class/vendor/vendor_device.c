@@ -185,6 +185,15 @@ void vendord_reset(uint8_t rhport) {
     tu_memclr(p_itf, ITF_MEM_RESET_SIZE);
     tu_edpt_stream_clear(&p_itf->rx.stream);
     tu_edpt_stream_clear(&p_itf->tx.stream);
+    // Beyondex vendor reset patch: also close the streams so ep_addr is zeroed.
+    // tud_vendor_n_mounted() keys off the stream ep_addr, which lives past
+    // ITF_MEM_RESET_SIZE and was never cleared here. After the first
+    // configuration the slot therefore looked permanently in use, vendord_open()
+    // refused interface 2, and every later SET_CONFIGURATION (bus reset, host
+    // reboot without a power cycle, driver disable/enable) was STALLed -> Code 10.
+    // Matches upstream hathach/tinyusb master vendord_reset().
+    tu_edpt_stream_close(&p_itf->rx.stream);
+    tu_edpt_stream_close(&p_itf->tx.stream);
   }
 }
 

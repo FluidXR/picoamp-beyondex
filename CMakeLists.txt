@@ -115,6 +115,7 @@ target_link_libraries(beyondex_usb_speaker
         hardware_dma
         hardware_flash
         hardware_sync
+        hardware_watchdog
         tinyusb_device
         tinyusb_board
         pico-i2s-pio

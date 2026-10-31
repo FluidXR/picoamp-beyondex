@@ -38,6 +38,7 @@
 
 #include "pico/stdlib.h"
 #include "pico/bootrom.h"
+#include "hardware/watchdog.h"
 #include "hardware/clocks.h"
 #include "hardware/dma.h"
 #include "hardware/flash.h"
@@ -209,6 +210,11 @@ int main(void)
 
   settings_load();
 
+  // 2s hardware watchdog fed from the main loop: a TinyUSB hard_assert/panic
+  // (e.g. DPRAM exhaustion) now self-recovers with a reboot instead of leaving
+  // the device enumerated-but-dead until a physical replug.
+  watchdog_enable(2000, 1);
+
   // init device stack on configured roothub port
   tud_init(BOARD_TUD_RHPORT);
   tud_sof_cb_enable(true);
@@ -230,6 +236,7 @@ int main(void)
 
   while (1)
   {
+    watchdog_update();
     tud_task(); // TinyUSB device task
     audio_task();
     led_blinking_task();

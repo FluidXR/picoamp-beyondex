@@ -160,7 +160,14 @@ extern "C" {
 // Size of control request buffer
 #define CFG_TUD_AUDIO_FUNC_1_CTRL_BUF_SZ	64
 
+// BEYONDEX_SYNC_MODE=1: synchronous isochronous sink, no feedback EP; the
+// device trims its own I2S clock to the host's rate (see tud_sof_cb). Works
+// around macOS 15.6 dropping ~23% of OUT packets on async+feedback devices.
+#ifdef BEYONDEX_SYNC_MODE
+#define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP    0
+#else
 #define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP    1
+#endif
 
 #define CFG_TUD_AUDIO_ENABLE_FEEDBACK_FORMAT_CORRECTION 1
 

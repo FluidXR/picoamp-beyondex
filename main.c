@@ -125,6 +125,7 @@ static volatile bool host_is_windows;
 static volatile uint32_t feedback;
 static volatile uint32_t sof_calls;
 static volatile uint32_t sof_updates;
+static volatile uint32_t dbg_rx_count, dbg_rx_zlp, dbg_rx_max_gap_us, dbg_rx_last_us, dbg_sof_max_gap_us, dbg_sof_last_us;
 
 void led_blinking_task(void);
 void audio_task(void);
@@ -534,6 +535,7 @@ void tud_sof_cb(uint32_t frame_count)
   (void)frame_count;
 
   sof_calls++;
+  { uint32_t now = (uint32_t)time_us_64(); if (dbg_sof_last_us) { uint32_t gap = now - dbg_sof_last_us; if (gap > dbg_sof_max_gap_us) dbg_sof_max_gap_us = gap; } dbg_sof_last_us = now; }
 
   // If stream not active, keep nominal and reset state.
   if (!spk_streaming_active)
@@ -541,6 +543,9 @@ void tud_sof_cb(uint32_t frame_count)
     fb_avg_us = 0;
     fb_i_us = 0;
     fb_avg_primed = false;
+#if !CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP
+    i2s_clktrim_set_offset_q8(0);
+#endif
     return;
   }
 
@@ -593,12 +598,20 @@ void tud_sof_cb(uint32_t frame_count)
   int32_t max_fb_q16 = nominal_q16 + (1 << 16);
   fb_q16 = clamp_i32(fb_q16, min_fb_q16, max_fb_q16);
 
+#if CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP
   tud_audio_fb_set((uint32_t)fb_q16);
+#else
+  // Synchronous mode: the host sends at nominal rate; steer our own I2S clock
+  // instead. delta>0 == buffer low == consume slower == larger divider.
+  // The device clock reacts immediately (unlike a host), so use 1/4 of the gain.
+  i2s_clktrim_set_offset_q8((int32_t)(((int64_t)delta_q16 * i2s_clktrim_base_q8()) / (4 * (int64_t)nominal_q16)));
+#endif
   sof_updates++;
 
   feedback = (uint32_t)fb_q16;
 }
 
+#if CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP
 bool tud_audio_feedback_format_correction_cb(uint8_t func_id)
 {
   (void)func_id;
@@ -607,6 +620,7 @@ bool tud_audio_feedback_format_correction_cb(uint8_t func_id)
   // other host gets TinyUSB's automatic 16.16→10.14 conversion.
   return !host_is_windows;
 }
+#endif
 
 bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const * p_request)
 {
@@ -621,7 +635,11 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const * p_reque
   {
     blink_interval_ms = BLINK_STREAMING;
     uint32_t nominal_fb = (current_sample_rate / 1000) << 16; // 16.16
+#if CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP
     tud_audio_fb_set(nominal_fb);                             // prime feedback EP
+#else
+    (void)nominal_fb;
+#endif
   }
 
   // Clear buffer when streaming format is changed
@@ -636,6 +654,7 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const * p_reque
 
 bool tud_audio_rx_done_pre_read_cb(uint8_t rhport, uint16_t n_bytes_received, uint8_t func_id, uint8_t ep_out, uint8_t cur_alt_setting)
 {
+  { uint32_t now = (uint32_t)time_us_64(); if (dbg_rx_last_us) { uint32_t gap = now - dbg_rx_last_us; if (gap > dbg_rx_max_gap_us) dbg_rx_max_gap_us = gap; } dbg_rx_last_us = now; dbg_rx_count++; if (n_bytes_received == 0) dbg_rx_zlp++; }
   (void)rhport;
   (void)func_id;
   (void)ep_out;
@@ -656,10 +675,12 @@ bool tud_audio_tx_done_pre_load_cb(uint8_t rhport, uint8_t itf, uint8_t ep_in, u
   return true;
 }
 
+#if CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP
 void tud_audio_fb_done_cb(uint8_t rhport)
 {
   return;
 }
+#endif
 
 //--------------------------------------------------------------------+
 // AUDIO Task
@@ -756,6 +777,13 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
         diag.overflow = i2s_dbg_get_overflow_count();
         diag.buf_len  = i2s_get_buf_length();
         diag.buf_us   = i2s_get_buf_us();
+        // Host-delivery diagnostics (control path): feedback = longest gap between
+        // audio OUT packets since last read (us); sof_calls = SOF count;
+        // sof_updates = longest SOF gap since last read (us); streaming_enabled =
+        // zero-length packets seen. Used to prove host-side packet loss on macOS 15.6.
+        diag.feedback = (int32_t)dbg_rx_max_gap_us; dbg_rx_max_gap_us = 0;
+        diag.sof_calls = sof_calls; diag.sof_updates = dbg_sof_max_gap_us; dbg_sof_max_gap_us = 0;
+        diag.streaming_enabled = (uint16_t)dbg_rx_zlp;
         return tud_control_xfer(rhport, request, &diag, sizeof(diag));
       }
       return false;

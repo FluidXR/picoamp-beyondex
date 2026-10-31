@@ -141,3 +141,9 @@ pico_set_boot_stage2(beyondex_usb_speaker slower_boot2)
 
 pico_add_extra_outputs(beyondex_usb_speaker)
 
+
+
+option(BEYONDEX_SYNC_MODE "Synchronous iso sink without feedback EP; device trims its I2S clock (macOS 15.6 workaround)" OFF)
+if(BEYONDEX_SYNC_MODE)
+  target_compile_definitions(beyondex_usb_speaker PRIVATE BEYONDEX_SYNC_MODE=1)
+endif()

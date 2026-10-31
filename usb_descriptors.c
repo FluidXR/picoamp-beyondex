@@ -72,7 +72,11 @@ tusb_desc_device_t const desc_device =
     // from a transient timeout) sticks across firmware updates because Windows
     // keys its driver cache on (VID, PID, bcdDevice, Serial) and rollbacks
     // alone don't change any of those.
+#ifdef BEYONDEX_SYNC_MODE
+    .bcdDevice          = 0x0145,   // sync-mode build of 1.44 (no feedback EP)
+#else
     .bcdDevice          = 0x0144,
+#endif
 
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
